@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
@@ -7,8 +8,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -75,6 +77,7 @@ class EQSettings:
 @dataclass(frozen=True)
 class ProcessingSettings:
 	eq: EQSettings = EQSettings()
+	outlier_iqr_multiplier: float = 1.5
 	clip_fraction: float = 0.25
 	contrast: float = 0.0
 	compression_threshold: float = 0.7
@@ -104,6 +107,9 @@ class AudioAnalysis:
 @dataclass(frozen=True)
 class ChannelNormalization:
 	frame_scales: np.ndarray
+	frame_maxima: np.ndarray
+	high_threshold: float
+	target_maximum: float
 	coefficient_min: float
 	coefficient_max: float
 	outlier_count: int
@@ -121,6 +127,13 @@ class ProcessedAudio:
 	analysis: AudioAnalysis
 	spectra: np.ndarray
 	state: ProcessingState
+
+
+@dataclass
+class ExportResult:
+	path: Path
+	preview_frames: np.ndarray | None = None
+	preview_fps: float = 0.0
 
 
 def _report(progress: ProgressCallback | None, phase: str, current: int, total: int) -> None:
@@ -193,10 +206,13 @@ def analyze_audio(
 	)
 
 
-def _outlier_normalize(channel: np.ndarray) -> tuple[np.ndarray, ChannelNormalization]:
+def _outlier_normalize(
+	channel: np.ndarray, iqr_multiplier: float
+) -> tuple[np.ndarray, ChannelNormalization]:
 	frame_maxima = np.max(channel, axis=1)
 	q1, q3 = np.percentile(frame_maxima, [25.0, 96.0])
-	high_threshold = q3 + 1.5 * (q3 - q1)
+	iqr_multiplier = max(0.0, float(iqr_multiplier))
+	high_threshold = float(q3 + iqr_multiplier * (q3 - q1))
 	outlier_mask = frame_maxima > high_threshold
 	non_outlier_maxima = frame_maxima[~outlier_mask]
 	target_maximum = float(np.mean(non_outlier_maxima)) if non_outlier_maxima.size else 0.0
@@ -216,6 +232,9 @@ def _outlier_normalize(channel: np.ndarray) -> tuple[np.ndarray, ChannelNormaliz
 
 	state = ChannelNormalization(
 		frame_scales=frame_scales,
+		frame_maxima=frame_maxima,
+		high_threshold=high_threshold,
+		target_maximum=target_maximum,
 		coefficient_min=coefficient_min,
 		coefficient_max=coefficient_max,
 		outlier_count=int(np.count_nonzero(outlier_mask)),
@@ -305,7 +324,7 @@ def process_audio(
 	normalizations: list[ChannelNormalization] = []
 	for channel_index in range(2):
 		working[:, :, channel_index], normalization = _outlier_normalize(
-			working[:, :, channel_index]
+			working[:, :, channel_index], settings.outlier_iqr_multiplier
 		)
 		normalizations.append(normalization)
 	_report(progress, "Clipping outliers", 2, 5)
@@ -566,6 +585,179 @@ def export_video(
 		temporary_video.unlink(missing_ok=True)
 
 
+def decode_video_preview(
+	video_path: str | Path,
+	width: int,
+	height: int,
+	cancel_event: threading.Event | None = None,
+) -> np.ndarray:
+	"""Decode an exported video into compact RGB frames for the embedded player."""
+	frame_bytes = width * height * 3
+	command = [
+		imageio_ffmpeg.get_ffmpeg_exe(),
+		"-loglevel",
+		"error",
+		"-i",
+		str(video_path),
+		"-an",
+		"-vf",
+		f"scale={width}:{height}",
+		"-pix_fmt",
+		"rgb24",
+		"-f",
+		"rawvideo",
+		"-",
+	]
+	process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	frames: list[np.ndarray] = []
+	try:
+		if process.stdout is None:
+			raise RuntimeError("ffmpeg did not provide a video stream.")
+		while True:
+			_check_cancelled(cancel_event)
+			data = process.stdout.read(frame_bytes)
+			if not data:
+				break
+			if len(data) != frame_bytes:
+				raise RuntimeError("The sample preview ended with an incomplete frame.")
+			frame = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3).copy()
+			frames.append(frame)
+		return_code = process.wait()
+		if return_code != 0:
+			stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+			raise RuntimeError(f"Could not decode the sample preview:\n{stderr[-2000:]}")
+	finally:
+		if process.poll() is None:
+			process.terminate()
+			process.wait()
+	if not frames:
+		raise RuntimeError("The generated sample contains no video frames.")
+	return np.stack(frames)
+
+
+class ColormapPicker(ttk.Frame):
+	"""A searchable dropdown whose rows include colormap gradient previews."""
+
+	def __init__(
+		self,
+		parent: tk.Misc,
+		variable: tk.StringVar,
+		choices: Sequence[str],
+		colormap_for_name: Callable[[str], Colormap],
+		on_select: Callable[[], None],
+	) -> None:
+		super().__init__(parent)
+		self.variable = variable
+		self.choices = list(choices)
+		self.colormap_for_name = colormap_for_name
+		self.on_select = on_select
+		self.popup: tk.Toplevel | None = None
+		self.tree: ttk.Treeview | None = None
+		self.search_var = tk.StringVar()
+		self.search_var.trace_add("write", lambda *_args: self._populate())
+		self.images: dict[str, tk.PhotoImage] = {}
+		self.item_names: dict[str, str] = {}
+		self.button = ttk.Button(self, textvariable=self.variable, command=self._open)
+		self.button.pack(fill=tk.X)
+
+	def set_choices(self, choices: Sequence[str]) -> None:
+		self.choices = list(choices)
+		self.images.clear()
+		if self.popup is not None:
+			self._populate()
+
+	def refresh_image(self, name: str) -> None:
+		self.images.pop(name, None)
+		if self.popup is not None:
+			self._populate()
+
+	def _preview_image(self, name: str) -> tk.PhotoImage:
+		if name in self.images:
+			return self.images[name]
+		lut = colormap_lut(self.colormap_for_name(name))
+		indices = np.linspace(0, len(lut) - 1, 88).astype(int)
+		colors = [f"#{red:02x}{green:02x}{blue:02x}" for red, green, blue in lut[indices]]
+		image = tk.PhotoImage(master=self, width=len(colors), height=14)
+		row = "{" + " ".join(colors) + "}"
+		for y_value in range(14):
+			image.put(row, to=(0, y_value))
+		self.images[name] = image
+		return image
+
+	def _open(self) -> None:
+		if self.popup is not None:
+			self._close()
+			return
+		popup = tk.Toplevel(self)
+		self.popup = popup
+		popup.overrideredirect(True)
+		popup.transient(self.winfo_toplevel())
+		popup.configure(background="#9aaba9")
+		popup.geometry(f"340x420+{self.winfo_rootx()}+{self.winfo_rooty() + self.winfo_height()}")
+
+		container = ttk.Frame(popup, padding=5)
+		container.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+		search = ttk.Entry(container, textvariable=self.search_var)
+		search.pack(fill=tk.X, pady=(0, 5))
+		list_frame = ttk.Frame(container)
+		list_frame.pack(fill=tk.BOTH, expand=True)
+		tree = ttk.Treeview(list_frame, show="tree", selectmode="browse")
+		self.tree = tree
+		scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
+		tree.configure(yscrollcommand=scrollbar.set)
+		tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+		tree.bind("<ButtonRelease-1>", self._choose)
+		tree.bind("<Return>", self._choose)
+		popup.bind("<Escape>", lambda _event: self._close())
+		popup.bind("<FocusOut>", self._focus_out)
+		self._populate()
+		popup.update_idletasks()
+		search.focus_set()
+
+	def _populate(self) -> None:
+		if self.tree is None:
+			return
+		query = self.search_var.get().strip().casefold()
+		self.tree.delete(*self.tree.get_children())
+		self.item_names.clear()
+		selected_item = None
+		for index, name in enumerate(self.choices):
+			if query and query not in name.casefold():
+				continue
+			item_id = f"map_{index}"
+			self.item_names[item_id] = name
+			self.tree.insert("", tk.END, iid=item_id, text=name, image=self._preview_image(name))
+			if name == self.variable.get():
+				selected_item = item_id
+		if selected_item is not None:
+			self.tree.selection_set(selected_item)
+			self.tree.see(selected_item)
+
+	def _choose(self, _event: object | None = None) -> None:
+		if self.tree is None or not self.tree.selection():
+			return
+		name = self.item_names[self.tree.selection()[0]]
+		self.variable.set(name)
+		self._close()
+		self.on_select()
+
+	def _focus_out(self, _event: object) -> None:
+		if self.popup is not None:
+			self.after_idle(self._close_if_focus_left)
+
+	def _close_if_focus_left(self) -> None:
+		if self.popup is not None and self.popup.focus_get() is None:
+			self._close()
+
+	def _close(self) -> None:
+		if self.popup is not None:
+			self.popup.destroy()
+		self.popup = None
+		self.tree = None
+		self.search_var.set("")
+
+
 class EQCurveEditor(ttk.Frame):
 	"""A compact draggable low-shelf, bell, and high-shelf editor."""
 
@@ -579,7 +771,10 @@ class EQCurveEditor(ttk.Frame):
 		self.low_gain = 0.0
 		self.bell_gain = 0.0
 		self.high_gain = 0.0
+		self.low_frequency = 120.0
 		self.bell_frequency = 1_000.0
+		self.high_frequency = 5_000.0
+		self.bell_width_octaves = 1.25
 		self.dragging: str | None = None
 
 		self.figure = Figure(figsize=(3.4, 2.25), dpi=100)
@@ -597,22 +792,38 @@ class EQCurveEditor(ttk.Frame):
 			low_gain_db=self.low_gain,
 			bell_gain_db=self.bell_gain,
 			high_gain_db=self.high_gain,
+			low_frequency=self.low_frequency,
 			bell_frequency=self.bell_frequency,
+			high_frequency=self.high_frequency,
+			bell_width_octaves=self.bell_width_octaves,
 		)
+
+	def set_settings(self, settings: EQSettings) -> None:
+		self.low_gain = settings.low_gain_db
+		self.bell_gain = settings.bell_gain_db
+		self.high_gain = settings.high_gain_db
+		self.low_frequency = settings.low_frequency
+		self.bell_frequency = settings.bell_frequency
+		self.high_frequency = settings.high_frequency
+		self.bell_width_octaves = settings.bell_width_octaves
+		self._draw()
 
 	def reset(self) -> None:
 		self.low_gain = 0.0
 		self.bell_gain = 0.0
 		self.high_gain = 0.0
+		self.low_frequency = 120.0
 		self.bell_frequency = 1_000.0
+		self.high_frequency = 5_000.0
+		self.bell_width_octaves = 1.25
 		self._draw()
 		self.on_change(self.settings())
 
 	def _control_points(self) -> dict[str, tuple[float, float]]:
 		return {
-			"low": (120.0, self.low_gain),
+			"low": (self.low_frequency, self.low_gain),
 			"bell": (self.bell_frequency, self.bell_gain),
-			"high": (5_000.0, self.high_gain),
+			"high": (self.high_frequency, self.high_gain),
 		}
 
 	def _draw(self) -> None:
@@ -628,7 +839,7 @@ class EQCurveEditor(ttk.Frame):
 			color = "#e45756" if name == "bell" else "#f2a541"
 			self.axis.scatter([frequency], [gain], s=52, color=color, edgecolor="#172a3a", zorder=5)
 			self.axis.annotate(
-				f"{gain:+.1f}",
+				f"{frequency:,.0f} Hz\n{gain:+.1f} dB",
 				(frequency, gain),
 				xytext=(0, 9),
 				textcoords="offset points",
@@ -672,13 +883,17 @@ class EQCurveEditor(ttk.Frame):
 		if y_value is None:
 			return
 		gain = float(np.clip(y_value, -24.0, 24.0))
+		x_value = getattr(event, "xdata", None)
 		if self.dragging == "low":
 			self.low_gain = gain
+			if x_value is not None:
+				self.low_frequency = float(np.clip(x_value, 40.0, min(1_000.0, self.high_frequency / 1.5)))
 		elif self.dragging == "high":
 			self.high_gain = gain
+			if x_value is not None:
+				self.high_frequency = float(np.clip(x_value, max(1_000.0, self.low_frequency * 1.5), 10_000.0))
 		else:
 			self.bell_gain = gain
-			x_value = getattr(event, "xdata", None)
 			if x_value is not None:
 				self.bell_frequency = float(np.clip(x_value, 180.0, 3_500.0))
 		self._draw()
@@ -691,9 +906,13 @@ class EQCurveEditor(ttk.Frame):
 
 
 class AudioVisualizerApp:
+	PROJECT_FORMAT = "auviz-project"
+	PROJECT_VERSION = 1
 	PREVIEW_WIDTH = 720
 	PREVIEW_HEIGHT = 405
-	SAMPLE_DURATION = 3.0
+	DEFAULT_SAMPLE_DURATION = 3.0
+	MIN_SAMPLE_DURATION = 0.25
+	MAX_SAMPLE_DURATION = 15.0
 
 	def __init__(self, root: tk.Tk) -> None:
 		self.root = root
@@ -705,13 +924,23 @@ class AudioVisualizerApp:
 		self.analysis: AudioAnalysis | None = None
 		self.processed: ProcessedAudio | None = None
 		self.audio_path: Path | None = None
+		self.project_path: Path | None = None
 		self.last_video: Path | None = None
+		self.pending_project_view: dict[str, float] | None = None
 		self.processing_dirty = True
 		self.normalization_reference = 1.0
 		self.preview_renderer: CartesianWaveRenderer | None = None
 		self.preview_after_id: str | None = None
 		self.sample_span = None
+		self.sample_preview_frames: np.ndarray | None = None
+		self.sample_preview_path: Path | None = None
+		self.sample_preview_fps = 0.0
+		self.sample_playback_after_id: str | None = None
+		self.sample_playback_started = 0.0
+		self.sample_playing = False
+		self.sample_audio_process: subprocess.Popen[bytes] | None = None
 		self.busy = False
+		self.export_active = False
 
 		self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auviz")
 		self.events: queue.Queue[tuple[object, ...]] = queue.Queue()
@@ -719,12 +948,16 @@ class AudioVisualizerApp:
 		self.action_widgets: list[ttk.Button] = []
 
 		self.custom_colors = ["#081c2c", "#087f8c", "#f2a541", "#e45756", "#f7f3e8"]
+		self.builtin_colormap_names = list(
+			dict.fromkeys(["turbo", "viridis", "inferno", "magma", "cividis", "RdBu_r", *sorted(matplotlib.colormaps)])
+		)
+		self.saved_colormaps = self._load_saved_colormaps()
 		self._create_variables()
 		self._configure_style()
 		self._create_layout()
 		self._redraw_colormap_swatch()
 		self._redraw_palette_buttons()
-		self.root.after(80, self._poll_events)
+		self.poll_after_id = self.root.after(80, self._poll_events)
 
 	def _create_variables(self) -> None:
 		self.file_name_var = tk.StringVar(value="No audio loaded")
@@ -735,12 +968,14 @@ class AudioVisualizerApp:
 		self.high_frequency_var = tk.DoubleVar(value=12_000.0)
 
 		self.clip_fraction_var = tk.DoubleVar(value=0.25)
+		self.outlier_iqr_multiplier_var = tk.DoubleVar(value=1.5)
 		self.contrast_var = tk.DoubleVar(value=0.0)
 		self.compression_threshold_var = tk.DoubleVar(value=0.7)
 		self.compression_amount_var = tk.DoubleVar(value=0.5)
 		self.smoothing_var = tk.DoubleVar(value=0.3)
 
 		self.colormap_var = tk.StringVar(value="turbo")
+		self.custom_colormap_name_var = tk.StringVar(value="")
 		self.colormap_upper_var = tk.DoubleVar(value=0.3)
 		self.resolution_var = tk.StringVar(value="1280 x 720")
 		self.output_path_var = tk.StringVar(value=str(Path.cwd() / "visualizer.mp4"))
@@ -749,7 +984,11 @@ class AudioVisualizerApp:
 		self.frame_entry_var = tk.StringVar(value="0")
 		self.frame_time_var = tk.StringVar(value="0.00 s")
 		self.sample_start_var = tk.DoubleVar(value=0.0)
+		self.sample_duration_var = tk.DoubleVar(value=self.DEFAULT_SAMPLE_DURATION)
 		self.sample_time_var = tk.StringVar(value="0.00 - 3.00 s")
+		self.sample_button_var = tk.StringVar(value="Render 3 s Sample")
+		self.sample_preview_var = tk.StringVar(value="No sample rendered")
+		self.export_progress_var = tk.StringVar(value="Ready to render")
 		self.status_var = tk.StringVar(value="Choose an audio file to begin")
 
 	def _configure_style(self) -> None:
@@ -789,6 +1028,11 @@ class AudioVisualizerApp:
 		header.pack(fill=tk.X)
 		ttk.Label(header, text="AUVIZ", style="Title.TLabel").pack(side=tk.LEFT)
 		ttk.Label(header, text="Wave Bundle Studio", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 0), pady=(8, 0))
+		save_project_button = ttk.Button(header, text="Save Project", command=self._save_project)
+		save_project_button.pack(side=tk.RIGHT)
+		open_project_button = ttk.Button(header, text="Open Project", command=self._open_project)
+		open_project_button.pack(side=tk.RIGHT, padx=(0, 8))
+		self.action_widgets.extend([open_project_button, save_project_button])
 
 		body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
 		body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
@@ -816,13 +1060,13 @@ class AudioVisualizerApp:
 		self.plot_notebook.pack(fill=tk.BOTH, expand=True)
 		frame_tab = ttk.Frame(self.plot_notebook)
 		spectrum_tab = ttk.Frame(self.plot_notebook)
-		timeline_tab = ttk.Frame(self.plot_notebook)
+		self.timeline_tab = ttk.Frame(self.plot_notebook)
 		self.plot_notebook.add(frame_tab, text="Frame")
 		self.plot_notebook.add(spectrum_tab, text="Spectrum")
-		self.plot_notebook.add(timeline_tab, text="Timeline")
+		self.plot_notebook.add(self.timeline_tab, text="Timeline")
 		self._build_frame_view(frame_tab)
 		self._build_spectrum_view(spectrum_tab)
-		self._build_timeline_view(timeline_tab)
+		self._build_timeline_view(self.timeline_tab)
 
 		status = ttk.Frame(self.root, padding=(14, 2, 14, 10))
 		status.pack(fill=tk.X)
@@ -857,6 +1101,7 @@ class AudioVisualizerApp:
 		self.eq_editor.pack(fill=tk.X, pady=(6, 2))
 		ttk.Button(tab, text="Reset EQ", command=self.eq_editor.reset).pack(anchor="e", pady=(0, 8))
 
+		self._add_slider(tab, "Outlier threshold (IQR)", self.outlier_iqr_multiplier_var, 0.0, 6.0, "{:.2f}")
 		self._add_slider(tab, "Small-coefficient clip", self.clip_fraction_var, 0.0, 0.99, "{:.2f}")
 		self._add_slider(tab, "Contrast", self.contrast_var, -1.0, 1.0, "{:+.2f}")
 		self._add_slider(tab, "Compression threshold", self.compression_threshold_var, 0.0, 1.0, "{:.2f}")
@@ -869,10 +1114,14 @@ class AudioVisualizerApp:
 	def _build_color_tab(self) -> None:
 		tab = self.color_tab
 		ttk.Label(tab, text="Colormap", style="Section.TLabel").pack(anchor="w")
-		names = list(dict.fromkeys(["turbo", "viridis", "inferno", "magma", "cividis", "RdBu_r", *sorted(matplotlib.colormaps), "Custom"]))
-		self.colormap_combo = ttk.Combobox(tab, textvariable=self.colormap_var, values=names, state="readonly")
-		self.colormap_combo.pack(fill=tk.X, pady=(6, 5))
-		self.colormap_combo.bind("<<ComboboxSelected>>", self._colormap_changed)
+		self.colormap_picker = ColormapPicker(
+			tab,
+			self.colormap_var,
+			self._colormap_names(),
+			self._colormap_for_name,
+			self._colormap_changed,
+		)
+		self.colormap_picker.pack(fill=tk.X, pady=(6, 5))
 		self.colormap_swatch = tk.Canvas(tab, height=24, highlightthickness=1, highlightbackground=self.colors["line"])
 		self.colormap_swatch.pack(fill=tk.X, pady=(0, 14))
 
@@ -883,6 +1132,15 @@ class AudioVisualizerApp:
 		palette_actions.pack(anchor="e")
 		ttk.Button(palette_actions, text="+", width=3, command=self._add_color).pack(side=tk.LEFT, padx=2)
 		ttk.Button(palette_actions, text="-", width=3, command=self._remove_color).pack(side=tk.LEFT, padx=2)
+
+		name_row = ttk.Frame(tab)
+		name_row.pack(fill=tk.X, pady=(12, 2))
+		ttk.Label(name_row, text="Palette name").pack(side=tk.LEFT)
+		ttk.Entry(name_row, textvariable=self.custom_colormap_name_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+		palette_storage = ttk.Frame(tab)
+		palette_storage.pack(fill=tk.X, pady=(3, 8))
+		ttk.Button(palette_storage, text="Delete Saved", command=self._delete_custom_colormap).pack(side=tk.LEFT)
+		ttk.Button(palette_storage, text="Save Palette", style="Accent.TButton", command=self._save_custom_colormap).pack(side=tk.RIGHT)
 
 		self._add_slider(tab, "Color upper bound", self.colormap_upper_var, 0.0, 1.0, "{:.2f}", self._color_control_changed)
 
@@ -904,14 +1162,20 @@ class AudioVisualizerApp:
 		self.action_widgets.append(browse_output)
 
 		ttk.Separator(tab).grid(row=4, column=0, columnspan=2, sticky="ew", pady=16)
-		sample_button = ttk.Button(tab, text="Render 3 s Sample", style="Accent.TButton", command=self._render_sample)
-		sample_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 7))
+		ttk.Label(tab, text="Render progress", style="Section.TLabel").grid(row=5, column=0, columnspan=2, sticky="w")
+		self.export_progress_bar = ttk.Progressbar(tab, mode="determinate", maximum=100.0)
+		self.export_progress_bar.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 3))
+		ttk.Label(tab, textvariable=self.export_progress_var, style="Muted.TLabel").grid(
+			row=7, column=0, columnspan=2, sticky="w", pady=(0, 14)
+		)
+		sample_button = ttk.Button(tab, textvariable=self.sample_button_var, style="Accent.TButton", command=self._render_sample)
+		sample_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 7))
 		full_button = ttk.Button(tab, text="Render Full Video", command=self._render_full)
-		full_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=7)
+		full_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=7)
 		open_button = ttk.Button(tab, text="Open Last Video", command=self._open_last_video)
-		open_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=7)
+		open_button.grid(row=10, column=0, columnspan=2, sticky="ew", pady=7)
 		self.cancel_button = ttk.Button(tab, text="Cancel", style="Danger.TButton", command=self._cancel, state=tk.DISABLED)
-		self.cancel_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+		self.cancel_button.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(22, 0))
 		self.action_widgets.extend([sample_button, full_button, open_button])
 		tab.columnconfigure(0, weight=1)
 
@@ -943,22 +1207,65 @@ class AudioVisualizerApp:
 	def _build_spectrum_view(self, parent: ttk.Frame) -> None:
 		self.spectrum_figure = Figure(figsize=(8.8, 5.8), dpi=100)
 		self.spectrum_figure.patch.set_facecolor(self.colors["paper"])
-		self.spectrum_axes = self.spectrum_figure.subplots(2, 1, sharex=True)
+		self.spectrum_axes = self.spectrum_figure.subplots(
+			3,
+			1,
+			gridspec_kw={"height_ratios": (1.0, 1.0, 1.15)},
+		)
 		self.spectrum_canvas = FigureCanvasTkAgg(self.spectrum_figure, master=parent)
 		self.spectrum_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 		self._style_spectrum_axes()
 
 	def _build_timeline_view(self, parent: ttk.Frame) -> None:
-		self.timeline_figure = Figure(figsize=(9.0, 3.6), dpi=100)
+		parent.columnconfigure(0, weight=1)
+		parent.rowconfigure(0, weight=1)
+
+		preview = ttk.Frame(parent, padding=(10, 8, 10, 4))
+		preview.grid(row=0, column=0, sticky="nsew")
+		preview.columnconfigure(0, weight=1)
+		preview.rowconfigure(0, weight=1)
+		self.sample_figure = Figure(figsize=(8.8, 4.8), dpi=100)
+		self.sample_figure.patch.set_facecolor(self.colors["paper"])
+		self.sample_axis = self.sample_figure.add_subplot(111)
+		self.sample_axis.set_facecolor("#10171c")
+		self.sample_axis.set_axis_off()
+		self.sample_image = self.sample_axis.imshow(
+			np.zeros((self.PREVIEW_HEIGHT, self.PREVIEW_WIDTH, 3), dtype=np.uint8),
+			origin="upper",
+			interpolation="nearest",
+		)
+		self.sample_canvas = FigureCanvasTkAgg(self.sample_figure, master=preview)
+		self.sample_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+		player_controls = ttk.Frame(preview, padding=(4, 5, 4, 0))
+		player_controls.grid(row=1, column=0, sticky="ew")
+		self.sample_play_button = ttk.Button(
+			player_controls,
+			text="Play",
+			width=9,
+			command=self._toggle_sample_playback,
+			state=tk.DISABLED,
+		)
+		self.sample_play_button.pack(side=tk.LEFT)
+		ttk.Label(
+			player_controls,
+			textvariable=self.sample_preview_var,
+			style="Muted.TLabel",
+		).pack(side=tk.LEFT, padx=(10, 0))
+
+		waveform = ttk.Frame(parent, padding=(10, 2, 10, 0))
+		waveform.grid(row=1, column=0, sticky="ew")
+		self.timeline_figure = Figure(figsize=(9.0, 1.45), dpi=100)
 		self.timeline_figure.patch.set_facecolor(self.colors["paper"])
 		self.timeline_axis = self.timeline_figure.add_subplot(111)
-		self.timeline_canvas = FigureCanvasTkAgg(self.timeline_figure, master=parent)
-		self.timeline_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+		self.timeline_canvas = FigureCanvasTkAgg(self.timeline_figure, master=waveform)
+		self.timeline_canvas.get_tk_widget().pack(fill=tk.X)
 		self.timeline_canvas.mpl_connect("button_press_event", self._timeline_clicked)
 
 		slider_row = ttk.Frame(parent, padding=(12, 8, 12, 14))
-		slider_row.pack(fill=tk.X)
-		ttk.Label(slider_row, text="Sample window").pack(side=tk.LEFT)
+		slider_row.grid(row=2, column=0, sticky="ew")
+		slider_row.columnconfigure(1, weight=1)
+		ttk.Label(slider_row, text="Start").grid(row=0, column=0, sticky="w")
 		self.sample_scale = ttk.Scale(
 			slider_row,
 			variable=self.sample_start_var,
@@ -966,8 +1273,22 @@ class AudioVisualizerApp:
 			to=0.0,
 			command=self._sample_slider_changed,
 		)
-		self.sample_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12)
-		ttk.Label(slider_row, textvariable=self.sample_time_var, style="Muted.TLabel", width=18, anchor="e").pack(side=tk.RIGHT)
+		self.sample_scale.grid(row=0, column=1, sticky="ew", padx=(10, 8))
+		ttk.Label(slider_row, textvariable=self.sample_time_var, style="Muted.TLabel", width=17, anchor="e").grid(row=0, column=2)
+		ttk.Label(slider_row, text="Length").grid(row=0, column=3, padx=(14, 5))
+		duration_entry = ttk.Spinbox(
+			slider_row,
+			textvariable=self.sample_duration_var,
+			from_=self.MIN_SAMPLE_DURATION,
+			to=self.MAX_SAMPLE_DURATION,
+			increment=0.25,
+			width=6,
+			command=self._sample_duration_changed,
+		)
+		duration_entry.grid(row=0, column=4)
+		duration_entry.bind("<Return>", self._sample_duration_changed)
+		duration_entry.bind("<FocusOut>", self._sample_duration_changed)
+		ttk.Label(slider_row, text="s", style="Muted.TLabel").grid(row=0, column=5, padx=(3, 0))
 
 	def _add_entry(self, parent: ttk.Frame, row: int, label: str, variable: tk.Variable) -> None:
 		ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
@@ -989,16 +1310,255 @@ class AudioVisualizerApp:
 		ttk.Label(container, text=label).pack(side=tk.LEFT)
 		value_label.pack(side=tk.RIGHT)
 
+		def update_label(*_args: object) -> None:
+			try:
+				value_label.configure(text=value_format.format(float(variable.get())))
+			except (ValueError, tk.TclError):
+				pass
+
+		variable.trace_add("write", update_label)
+
 		def changed(raw_value: str) -> None:
 			value = float(raw_value)
 			variable.set(value)
-			value_label.configure(text=value_format.format(value))
 			if on_change is None:
 				self._mark_processing_dirty()
 			else:
 				on_change()
 
 		ttk.Scale(parent, variable=variable, from_=minimum, to=maximum, command=changed).pack(fill=tk.X, pady=(0, 3))
+
+	@staticmethod
+	def _project_path_value(path: Path | None, project_path: Path) -> dict[str, object] | None:
+		if path is None:
+			return None
+		try:
+			value = os.path.relpath(path.expanduser().resolve(), project_path.parent)
+			return {"value": value, "relative": True}
+		except (OSError, ValueError):
+			return {"value": str(path), "relative": False}
+
+	@staticmethod
+	def _resolve_project_path(value: object, project_path: Path) -> Path | None:
+		if value is None:
+			return None
+		if not isinstance(value, dict) or not isinstance(value.get("value"), str):
+			raise ValueError("The project contains an invalid file path.")
+		path = Path(value["value"]).expanduser()
+		if bool(value.get("relative", False)):
+			path = project_path.parent / path
+		return path.resolve()
+
+	def _project_payload(self, project_path: Path) -> dict[str, object]:
+		return {
+			"format": self.PROJECT_FORMAT,
+			"version": self.PROJECT_VERSION,
+			"paths": {
+				"audio": self._project_path_value(self.audio_path, project_path),
+				"output": self._project_path_value(Path(self.output_path_var.get()), project_path),
+				"last_video": self._project_path_value(self.last_video, project_path),
+			},
+			"analysis": {
+				"fps": int(self.fps_var.get()),
+				"fft_size": int(self.fft_size_var.get()),
+				"low_frequency": float(self.low_frequency_var.get()),
+				"high_frequency": float(self.high_frequency_var.get()),
+			},
+			"processing": {
+				"eq": asdict(self.eq_editor.settings()),
+				"outlier_iqr_multiplier": float(self.outlier_iqr_multiplier_var.get()),
+				"clip_fraction": float(self.clip_fraction_var.get()),
+				"contrast": float(self.contrast_var.get()),
+				"compression_threshold": float(self.compression_threshold_var.get()),
+				"compression_amount": float(self.compression_amount_var.get()),
+				"smoothing": float(self.smoothing_var.get()),
+			},
+			"color": {
+				"colormap": self.colormap_var.get(),
+				"custom_name": self.custom_colormap_name_var.get(),
+				"custom_colors": list(self.custom_colors),
+				"saved_colormaps": self.saved_colormaps,
+				"upper_bound": float(self.colormap_upper_var.get()),
+			},
+			"export": {"resolution": self.resolution_var.get()},
+			"view": {
+				"frame_index": float(self.frame_var.get()),
+				"sample_start": float(self.sample_start_var.get()),
+				"sample_duration": float(self.sample_duration_var.get()),
+				"control_tab": self.control_notebook.index("current"),
+				"plot_tab": self.plot_notebook.index("current"),
+			},
+		}
+
+	def _save_project(self) -> None:
+		initial_name = self.project_path.name if self.project_path is not None else "visualizer.auviz"
+		selected = filedialog.asksaveasfilename(
+			title="Save AUVIZ project",
+			defaultextension=".auviz",
+			filetypes=[("AUVIZ project", "*.auviz"), ("JSON", "*.json")],
+			initialfile=initial_name,
+		)
+		if not selected:
+			return
+		project_path = Path(selected).expanduser().resolve()
+		try:
+			payload = self._project_payload(project_path)
+			project_path.parent.mkdir(parents=True, exist_ok=True)
+			temporary_path = project_path.with_suffix(project_path.suffix + ".tmp")
+			temporary_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+			temporary_path.replace(project_path)
+		except (OSError, ValueError, tk.TclError) as error:
+			messagebox.showerror("Could not save project", str(error))
+			return
+		self.project_path = project_path
+		self._update_project_title()
+		self.status_var.set(f"Project saved | {project_path.name}")
+
+	def _open_project(self) -> None:
+		selected = filedialog.askopenfilename(
+			title="Open AUVIZ project",
+			filetypes=[("AUVIZ project", "*.auviz *.json"), ("All files", "*.*")],
+		)
+		if selected:
+			self._load_project(Path(selected))
+
+	def _load_project(self, project_path: Path) -> None:
+		project_path = project_path.expanduser().resolve()
+		try:
+			payload = json.loads(project_path.read_text(encoding="utf-8"))
+			if not isinstance(payload, dict) or payload.get("format") != self.PROJECT_FORMAT:
+				raise ValueError("This is not an AUVIZ project file.")
+			version = int(payload.get("version", 0))
+			if version < 1 or version > self.PROJECT_VERSION:
+				raise ValueError(f"Unsupported AUVIZ project version: {version}.")
+			self._apply_project_payload(payload, project_path)
+		except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError, tk.TclError) as error:
+			messagebox.showerror("Could not open project", str(error))
+			return
+		self.project_path = project_path
+		self._update_project_title()
+		if self.audio_path is None:
+			self.status_var.set(f"Project loaded | {project_path.name}")
+		elif not self.audio_path.exists():
+			self.status_var.set("Project loaded | audio file missing")
+			messagebox.showwarning(
+				"Audio file not found",
+				f"The project settings were restored, but the audio file could not be found:\n{self.audio_path}",
+			)
+		else:
+			self.status_var.set(f"Project loaded | analyzing {self.audio_path.name}")
+			self._analyze()
+
+	def _apply_project_payload(self, payload: dict[str, object], project_path: Path) -> None:
+		paths = payload.get("paths", {})
+		analysis = payload.get("analysis", {})
+		processing = payload.get("processing", {})
+		color = payload.get("color", {})
+		export = payload.get("export", {})
+		view = payload.get("view", {})
+		if not all(isinstance(section, dict) for section in (paths, analysis, processing, color, export, view)):
+			raise ValueError("The project settings are malformed.")
+		self._clear_media_state()
+
+		self.audio_path = self._resolve_project_path(paths.get("audio"), project_path)
+		output_path = self._resolve_project_path(paths.get("output"), project_path)
+		self.last_video = self._resolve_project_path(paths.get("last_video"), project_path)
+		if self.audio_path is not None:
+			self.file_name_var.set(self.audio_path.name)
+			self.audio_info_var.set(str(self.audio_path.parent))
+		if output_path is not None:
+			self.output_path_var.set(str(output_path))
+
+		self.fps_var.set(int(analysis.get("fps", 24)))
+		self.fft_size_var.set(int(analysis.get("fft_size", 12_000)))
+		self.low_frequency_var.set(float(analysis.get("low_frequency", 30.0)))
+		self.high_frequency_var.set(float(analysis.get("high_frequency", 12_000.0)))
+
+		eq_data = processing.get("eq", {})
+		if not isinstance(eq_data, dict):
+			raise ValueError("The project EQ settings are malformed.")
+		eq_defaults = asdict(EQSettings())
+		eq_settings = EQSettings(**{
+			key: float(eq_data.get(key, default)) for key, default in eq_defaults.items()
+		})
+		self.eq_editor.set_settings(eq_settings)
+		self.outlier_iqr_multiplier_var.set(float(processing.get("outlier_iqr_multiplier", 1.5)))
+		self.clip_fraction_var.set(float(processing.get("clip_fraction", 0.25)))
+		self.contrast_var.set(float(processing.get("contrast", 0.0)))
+		self.compression_threshold_var.set(float(processing.get("compression_threshold", 0.7)))
+		self.compression_amount_var.set(float(processing.get("compression_amount", 0.5)))
+		self.smoothing_var.set(float(processing.get("smoothing", 0.3)))
+
+		custom_colors = color.get("custom_colors", self.custom_colors)
+		if not (
+			isinstance(custom_colors, list)
+			and len(custom_colors) >= 2
+			and all(isinstance(item, str) and matplotlib.colors.is_color_like(item) for item in custom_colors)
+		):
+			raise ValueError("The project custom palette is malformed.")
+		project_colormaps = color.get("saved_colormaps", {})
+		if not isinstance(project_colormaps, dict):
+			raise ValueError("The project saved palettes are malformed.")
+		for name, colors in project_colormaps.items():
+			if (
+				isinstance(name, str)
+				and isinstance(colors, list)
+				and len(colors) >= 2
+				and all(isinstance(item, str) and matplotlib.colors.is_color_like(item) for item in colors)
+			):
+				self.saved_colormaps[name] = list(colors)
+		self.custom_colors = list(custom_colors)
+		colormap_name = str(color.get("colormap", "turbo"))
+		if colormap_name not in self._colormap_names():
+			colormap_name = "Custom"
+		self.colormap_var.set(colormap_name)
+		self.custom_colormap_name_var.set(str(color.get("custom_name", "")))
+		self.colormap_upper_var.set(float(color.get("upper_bound", 0.3)))
+		self.colormap_picker.set_choices(self._colormap_names())
+		self._redraw_palette_buttons()
+		self._redraw_colormap_swatch()
+
+		self.resolution_var.set(str(export.get("resolution", "1280 x 720")))
+		self.sample_duration_var.set(float(view.get("sample_duration", self.DEFAULT_SAMPLE_DURATION)))
+		self.pending_project_view = {
+			"frame_index": float(view.get("frame_index", 0.0)),
+			"sample_start": float(view.get("sample_start", 0.0)),
+		}
+		self._sample_duration_changed()
+		self.sample_start_var.set(self.pending_project_view["sample_start"])
+		self._update_sample_span()
+		self.control_notebook.select(int(np.clip(int(view.get("control_tab", 0)), 0, 3)))
+		self.plot_notebook.select(int(np.clip(int(view.get("plot_tab", 0)), 0, 2)))
+		self.processing_dirty = True
+
+	def _clear_media_state(self) -> None:
+		self._stop_sample_playback(reset=False)
+		self.analysis = None
+		self.processed = None
+		self.preview_renderer = None
+		self.normalization_reference = 1.0
+		self.sample_preview_frames = None
+		self.sample_preview_path = None
+		self.sample_preview_fps = 0.0
+		self.sample_preview_var.set("No sample rendered")
+		self.sample_play_button.configure(state=tk.DISABLED, text="Play")
+		self.frame_scale.configure(to=0)
+		self.sample_scale.configure(to=0.0)
+		self.frame_axis.clear()
+		self.frame_axis.set_axis_off()
+		self.frame_axis.imshow(np.zeros((180, 320, 3), dtype=np.uint8), origin="upper")
+		self.frame_canvas.draw_idle()
+		for axis in self.spectrum_axes:
+			axis.clear()
+		self._style_spectrum_axes()
+		self.spectrum_canvas.draw_idle()
+		self.timeline_axis.clear()
+		self.sample_span = None
+		self.timeline_canvas.draw_idle()
+
+	def _update_project_title(self) -> None:
+		name = self.project_path.name if self.project_path is not None else "Untitled"
+		self.root.title(f"AUVIZ - {name}")
 
 	def _choose_audio(self) -> None:
 		selected = filedialog.askopenfilename(
@@ -1031,6 +1591,7 @@ class AudioVisualizerApp:
 	def _processing_settings(self) -> ProcessingSettings:
 		return ProcessingSettings(
 			eq=self.eq_editor.settings(),
+			outlier_iqr_multiplier=float(self.outlier_iqr_multiplier_var.get()),
 			clip_fraction=float(self.clip_fraction_var.get()),
 			contrast=float(self.contrast_var.get()),
 			compression_threshold=float(self.compression_threshold_var.get()),
@@ -1069,11 +1630,29 @@ class AudioVisualizerApp:
 			f"{analysis.frame_count:,} frames | {analysis.frequencies.size:,} bins"
 		)
 		self.frame_scale.configure(to=max(0, analysis.frame_count - 1))
-		self.sample_scale.configure(to=max(0.0, analysis.duration - self.SAMPLE_DURATION))
-		self.frame_var.set(0.0)
-		self.frame_entry_var.set("0")
-		self.sample_start_var.set(0.0)
+		self._sample_duration_changed()
+		if self.pending_project_view is None:
+			frame_index = 0
+			sample_start = 0.0
+		else:
+			frame_index = int(np.clip(
+				round(self.pending_project_view["frame_index"]),
+				0,
+				analysis.frame_count - 1,
+			))
+			maximum_start = max(0.0, analysis.duration - self._sample_duration())
+			sample_start = float(np.clip(
+				self.pending_project_view["sample_start"],
+				0.0,
+				maximum_start,
+			))
+			self.pending_project_view = None
+		self.frame_var.set(frame_index)
+		self.frame_entry_var.set(str(frame_index))
+		self.frame_time_var.set(f"{frame_index / analysis.fps:.2f} s")
+		self.sample_start_var.set(sample_start)
 		self._draw_waveform()
+		self._render_current_frame()
 		self.status_var.set("Analysis complete")
 
 	def _process(self, after: Callable[[], None] | None = None) -> None:
@@ -1125,12 +1704,112 @@ class AudioVisualizerApp:
 		if self.processed is not None:
 			self._schedule_preview(50)
 
+	@staticmethod
+	def _colormap_store_path() -> Path:
+		override = os.environ.get("AUVIZ_CONFIG_DIR")
+		if override:
+			return Path(override).expanduser() / "colormaps.json"
+		if sys.platform == "darwin":
+			folder = Path.home() / "Library" / "Application Support" / "AUVIZ"
+		elif os.name == "nt":
+			folder = Path(os.environ.get("APPDATA", Path.home())) / "AUVIZ"
+		else:
+			folder = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "auviz"
+		return folder / "colormaps.json"
+
+	def _load_saved_colormaps(self) -> dict[str, list[str]]:
+		try:
+			payload = json.loads(self._colormap_store_path().read_text(encoding="utf-8"))
+		except (OSError, json.JSONDecodeError):
+			return {}
+		if not isinstance(payload, dict):
+			return {}
+		palettes: dict[str, list[str]] = {}
+		for name, colors in payload.items():
+			if (
+				isinstance(name, str)
+				and isinstance(colors, list)
+				and len(colors) >= 2
+				and all(isinstance(color, str) and matplotlib.colors.is_color_like(color) for color in colors)
+			):
+				palettes[name] = list(colors)
+		return palettes
+
+	def _persist_saved_colormaps(self, palettes: dict[str, list[str]]) -> None:
+		path = self._colormap_store_path()
+		path.parent.mkdir(parents=True, exist_ok=True)
+		temporary_path = path.with_suffix(".tmp")
+		temporary_path.write_text(json.dumps(palettes, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+		temporary_path.replace(path)
+
+	def _colormap_names(self) -> list[str]:
+		featured = ["turbo", "viridis", "inferno", "magma", "cividis", "RdBu_r"]
+		return list(
+			dict.fromkeys([*featured, "Custom", *sorted(self.saved_colormaps), *self.builtin_colormap_names])
+		)
+
+	def _colormap_for_name(self, name: str) -> Colormap:
+		if name in self.saved_colormaps:
+			return LinearSegmentedColormap.from_list(name, self.saved_colormaps[name], N=256)
+		return build_colormap(name, self.custom_colors)
+
 	def _colormap_changed(self, _event: object | None = None) -> None:
+		name = self.colormap_var.get()
+		if name in self.saved_colormaps:
+			self.custom_colors = list(self.saved_colormaps[name])
+			self.custom_colormap_name_var.set(name)
+			self._redraw_palette_buttons()
+		elif name != "Custom":
+			self.custom_colormap_name_var.set("")
 		self._redraw_colormap_swatch()
 		self._color_control_changed()
 
 	def _current_colormap(self) -> Colormap:
-		return build_colormap(self.colormap_var.get(), self.custom_colors)
+		return self._colormap_for_name(self.colormap_var.get())
+
+	def _save_custom_colormap(self) -> None:
+		name = self.custom_colormap_name_var.get().strip()
+		if not name:
+			messagebox.showerror("Palette name required", "Type a name before saving the palette.")
+			return
+		reserved_names = {item.casefold() for item in ["Custom", *self.builtin_colormap_names]}
+		if name.casefold() in reserved_names:
+			messagebox.showerror("Palette name unavailable", "Choose a name that is not a built-in colormap.")
+			return
+		updated = dict(self.saved_colormaps)
+		updated[name] = list(self.custom_colors)
+		try:
+			self._persist_saved_colormaps(updated)
+		except OSError as error:
+			messagebox.showerror("Could not save palette", str(error))
+			return
+		self.saved_colormaps = updated
+		self.colormap_var.set(name)
+		self.colormap_picker.set_choices(self._colormap_names())
+		self._redraw_colormap_swatch()
+		self._color_control_changed()
+		self.status_var.set(f"Saved colormap | {name}")
+
+	def _delete_custom_colormap(self) -> None:
+		name = self.custom_colormap_name_var.get().strip()
+		if name not in self.saved_colormaps:
+			messagebox.showinfo("No saved palette", "Select a saved custom palette to delete it.")
+			return
+		updated = dict(self.saved_colormaps)
+		updated.pop(name)
+		try:
+			self._persist_saved_colormaps(updated)
+		except OSError as error:
+			messagebox.showerror("Could not delete palette", str(error))
+			return
+		self.saved_colormaps = updated
+		self.colormap_var.set("Custom")
+		self.custom_colormap_name_var.set("")
+		self.colormap_picker.set_choices(self._colormap_names())
+		self.colormap_picker.refresh_image("Custom")
+		self._redraw_colormap_swatch()
+		self._color_control_changed()
+		self.status_var.set(f"Deleted colormap | {name}")
 
 	def _redraw_colormap_swatch(self) -> None:
 		if not hasattr(self, "colormap_swatch"):
@@ -1164,10 +1843,7 @@ class AudioVisualizerApp:
 		selected = colorchooser.askcolor(self.custom_colors[index], parent=self.root)[1]
 		if selected:
 			self.custom_colors[index] = selected
-			self.colormap_var.set("Custom")
-			self._redraw_palette_buttons()
-			self._redraw_colormap_swatch()
-			self._color_control_changed()
+			self._custom_palette_changed()
 
 	def _add_color(self) -> None:
 		if len(self.custom_colors) >= 10:
@@ -1175,16 +1851,17 @@ class AudioVisualizerApp:
 		selected = colorchooser.askcolor("#ffffff", parent=self.root)[1]
 		if selected:
 			self.custom_colors.append(selected)
-			self.colormap_var.set("Custom")
-			self._redraw_palette_buttons()
-			self._redraw_colormap_swatch()
-			self._color_control_changed()
+			self._custom_palette_changed()
 
 	def _remove_color(self) -> None:
 		if len(self.custom_colors) <= 2:
 			return
 		self.custom_colors.pop()
+		self._custom_palette_changed()
+
+	def _custom_palette_changed(self) -> None:
 		self.colormap_var.set("Custom")
+		self.colormap_picker.refresh_image("Custom")
 		self._redraw_palette_buttons()
 		self._redraw_colormap_swatch()
 		self._color_control_changed()
@@ -1258,7 +1935,9 @@ class AudioVisualizerApp:
 		before, after = diagnostic_clipping_frame(self.processed, frame_index)
 		frequencies = self.processed.analysis.frequencies
 		channel_specs = (("Left", 0, self.colors["teal"]), ("Right", 1, self.colors["coral"]))
-		for axis, (name, channel, color) in zip(self.spectrum_axes, channel_specs):
+		for axis in self.spectrum_axes[:2]:
+			axis.set_xscale("linear")
+		for axis, (name, channel, color) in zip(self.spectrum_axes[:2], channel_specs):
 			axis.clear()
 			axis.plot(frequencies, before[:, channel], color="#8a9a9d", linewidth=0.8, alpha=0.8, label="Before")
 			axis.plot(frequencies, after[:, channel], color=color, linewidth=1.0, label="After")
@@ -1267,8 +1946,47 @@ class AudioVisualizerApp:
 			axis.set_xscale("log")
 			axis.set_ylabel(f"{name} magnitude", fontsize=8)
 			axis.legend(loc="upper right", fontsize=7, ncols=3, frameon=False)
-		self.spectrum_axes[-1].set_xlabel("Frequency (Hz)", fontsize=8)
+		self.spectrum_axes[1].set_xlabel("Frequency (Hz)", fontsize=8)
 		self.spectrum_axes[0].set_title(f"Small-coefficient clipping | frame {frame_index}", fontsize=10)
+
+		maxima_axis = self.spectrum_axes[2]
+		maxima_axis.clear()
+		frame_indices = np.arange(self.processed.analysis.frame_count)
+		for name, channel, color in channel_specs:
+			normalization = self.processed.state.channel_normalizations[channel]
+			raw_maxima = normalization.frame_maxima
+			clipped_maxima = raw_maxima * normalization.frame_scales
+			maxima_axis.plot(
+				frame_indices,
+				raw_maxima,
+				color=color,
+				linewidth=0.75,
+				alpha=0.35,
+				label=f"{name} raw",
+			)
+			maxima_axis.plot(
+				frame_indices,
+				clipped_maxima,
+				color=color,
+				linewidth=1.15,
+				label=f"{name} clipped",
+			)
+			maxima_axis.axhline(
+				normalization.high_threshold,
+				color=color,
+				linewidth=0.9,
+				linestyle="--",
+				label=f"{name} threshold",
+			)
+		maxima_axis.axvline(frame_index, color=self.colors["ink"], linewidth=0.8, alpha=0.7)
+		maxima_axis.set_xlim(0, max(1, self.processed.analysis.frame_count - 1))
+		maxima_axis.set_xlabel("Frame index", fontsize=8)
+		maxima_axis.set_ylabel("Max FFT coefficient", fontsize=8)
+		maxima_axis.set_title(
+			f"Outlier clipping | IQR multiplier {self.processed.state.settings.outlier_iqr_multiplier:.2f}",
+			fontsize=9,
+		)
+		maxima_axis.legend(loc="upper right", fontsize=6.5, ncols=3, frameon=False)
 		self._style_spectrum_axes()
 		self.spectrum_figure.tight_layout(pad=1.0)
 		self.spectrum_canvas.draw_idle()
@@ -1305,20 +2023,41 @@ class AudioVisualizerApp:
 		self.sample_start_var.set(float(raw_value))
 		self._update_sample_span()
 
+	def _sample_duration(self) -> float:
+		try:
+			duration = float(self.sample_duration_var.get())
+		except (ValueError, tk.TclError):
+			duration = self.DEFAULT_SAMPLE_DURATION
+		duration = float(np.clip(duration, self.MIN_SAMPLE_DURATION, self.MAX_SAMPLE_DURATION))
+		if self.analysis is not None:
+			duration = min(duration, self.analysis.duration)
+		return duration
+
+	def _sample_duration_changed(self, _event: object | None = None) -> None:
+		duration = self._sample_duration()
+		self.sample_duration_var.set(round(duration, 2))
+		self.sample_button_var.set(f"Render {duration:g} s Sample")
+		if self.analysis is not None:
+			maximum = max(0.0, self.analysis.duration - duration)
+			self.sample_scale.configure(to=maximum)
+			self.sample_start_var.set(min(float(self.sample_start_var.get()), maximum))
+		self._update_sample_span()
+
 	def _timeline_clicked(self, event: object) -> None:
 		if self.analysis is None or getattr(event, "inaxes", None) is not self.timeline_axis:
 			return
 		x_value = getattr(event, "xdata", None)
 		if x_value is None:
 			return
-		maximum = max(0.0, self.analysis.duration - self.SAMPLE_DURATION)
-		start = float(np.clip(x_value - self.SAMPLE_DURATION / 2.0, 0.0, maximum))
+		duration = self._sample_duration()
+		maximum = max(0.0, self.analysis.duration - duration)
+		start = float(np.clip(x_value - duration / 2.0, 0.0, maximum))
 		self.sample_start_var.set(start)
 		self._update_sample_span()
 
 	def _update_sample_span(self) -> None:
 		start = float(self.sample_start_var.get())
-		end = start + self.SAMPLE_DURATION
+		end = start + self._sample_duration()
 		self.sample_time_var.set(f"{start:.2f} - {end:.2f} s")
 		if not hasattr(self, "timeline_axis"):
 			return
@@ -1344,6 +2083,8 @@ class AudioVisualizerApp:
 		return int(parts[0]), int(parts[1])
 
 	def _render_sample(self) -> None:
+		self.plot_notebook.select(self.timeline_tab)
+		self.sample_preview_var.set(f"Rendering {self._sample_duration():g} s sample...")
 		self._ensure_processed(lambda: self._start_export(sample=True))
 
 	def _render_full(self) -> None:
@@ -1375,28 +2116,112 @@ class AudioVisualizerApp:
 
 		processed = self.processed
 		start_seconds = float(self.sample_start_var.get()) if sample else 0.0
-		duration_seconds = self.SAMPLE_DURATION if sample else None
+		duration_seconds = self._sample_duration() if sample else None
+		colormap_upper = float(self.colormap_upper_var.get())
+		self.export_active = True
+		self.export_progress_bar.configure(value=0.0)
+		self.export_progress_var.set(
+			f"Starting {duration_seconds:g} s sample..." if sample and duration_seconds is not None else "Starting full render..."
+		)
 
-		def task() -> Path:
-			return export_video(
+		def task() -> ExportResult:
+			result_path = export_video(
 				processed,
 				output,
 				width,
 				height,
 				colormap,
-				float(self.colormap_upper_var.get()),
+				colormap_upper,
 				start_seconds=start_seconds,
 				duration_seconds=duration_seconds,
 				progress=self._queue_progress,
 				cancel_event=self.cancel_event,
 			)
+			if not sample:
+				return ExportResult(path=result_path)
+			self._queue_progress("Preparing preview", 0, 1)
+			frames = decode_video_preview(
+				result_path,
+				self.PREVIEW_WIDTH,
+				self.PREVIEW_HEIGHT,
+				self.cancel_event,
+			)
+			self._queue_progress("Preparing preview", 1, 1)
+			return ExportResult(
+				path=result_path,
+				preview_frames=frames,
+				preview_fps=float(processed.analysis.fps),
+			)
 
 		self._submit(task, self._export_complete)
 
-	def _export_complete(self, output: Path) -> None:
-		self.last_video = output
-		self.status_var.set(f"Saved {output.name}")
-		messagebox.showinfo("Video complete", f"Saved to:\n{output}")
+	def _export_complete(self, result: ExportResult) -> None:
+		self.last_video = result.path
+		self.status_var.set(f"Saved {result.path.name}")
+		self.export_progress_bar.configure(value=100.0)
+		self.export_progress_var.set(f"Complete | {result.path.name}")
+		if result.preview_frames is None:
+			messagebox.showinfo("Video complete", f"Saved to:\n{result.path}")
+			return
+		self.sample_preview_frames = result.preview_frames
+		self.sample_preview_path = result.path
+		self.sample_preview_fps = result.preview_fps
+		self.sample_preview_var.set(f"{result.path.name} | {len(result.preview_frames) / result.preview_fps:.1f} s")
+		self.sample_play_button.configure(state=tk.NORMAL, text="Play")
+		self.plot_notebook.select(self.timeline_tab)
+		self._start_sample_playback()
+
+	def _toggle_sample_playback(self) -> None:
+		if self.sample_playing:
+			self._stop_sample_playback(reset=False)
+		else:
+			self._start_sample_playback()
+
+	def _start_sample_playback(self) -> None:
+		if self.sample_preview_frames is None or self.sample_preview_path is None:
+			return
+		self._stop_sample_playback(reset=True)
+		self.sample_playing = True
+		self.sample_playback_started = time.monotonic()
+		self.sample_play_button.configure(text="Stop")
+		if sys.platform == "darwin" and Path("/usr/bin/afplay").exists():
+			self.sample_audio_process = subprocess.Popen(
+				["/usr/bin/afplay", str(self.sample_preview_path)],
+				stdout=subprocess.DEVNULL,
+				stderr=subprocess.DEVNULL,
+			)
+		self._advance_sample_playback()
+
+	def _advance_sample_playback(self) -> None:
+		if not self.sample_playing or self.sample_preview_frames is None:
+			return
+		elapsed = time.monotonic() - self.sample_playback_started
+		frame_index = min(
+			int(elapsed * self.sample_preview_fps),
+			len(self.sample_preview_frames) - 1,
+		)
+		self.sample_image.set_data(self.sample_preview_frames[frame_index])
+		self.sample_canvas.draw_idle()
+		if frame_index >= len(self.sample_preview_frames) - 1:
+			self._stop_sample_playback(reset=False)
+			self.sample_play_button.configure(text="Replay")
+			return
+		self.sample_playback_after_id = self.root.after(15, self._advance_sample_playback)
+
+	def _stop_sample_playback(self, reset: bool) -> None:
+		self.sample_playing = False
+		if self.sample_playback_after_id is not None:
+			self.root.after_cancel(self.sample_playback_after_id)
+			self.sample_playback_after_id = None
+		if self.sample_audio_process is not None:
+			if self.sample_audio_process.poll() is None:
+				self.sample_audio_process.terminate()
+			self.sample_audio_process = None
+		if reset and self.sample_preview_frames is not None:
+			self.sample_image.set_data(self.sample_preview_frames[0])
+			self.sample_canvas.draw_idle()
+		if self.sample_preview_frames is not None:
+			self.sample_play_button.configure(text="Replay")
 
 	def _open_last_video(self) -> None:
 		if self.last_video is None or not self.last_video.exists():
@@ -1431,23 +2256,37 @@ class AudioVisualizerApp:
 					total_value = max(1, int(total))
 					self.progress_bar.configure(maximum=total_value, value=int(current))
 					self.status_var.set(f"{phase} | {int(current):,} / {total_value:,}")
+					if getattr(self, "export_active", False):
+						fraction = float(current) / total_value
+						if phase == "Preparing preview":
+							fraction = 1.0
+						self.export_progress_bar.configure(value=100.0 * fraction)
+						self.export_progress_var.set(f"{phase} | {fraction:.0%}")
 				elif event[0] == "done":
 					_, future, completed = event
+					was_export = getattr(self, "export_active", False)
 					self.busy = False
 					self._set_actions_enabled(True)
 					try:
 						result = future.result()
 					except WorkCancelled:
 						self.status_var.set("Cancelled")
+						if was_export:
+							self.export_progress_var.set("Render cancelled")
 					except Exception as error:
 						self.status_var.set("Operation failed")
+						if was_export:
+							self.export_progress_var.set("Render failed")
 						messagebox.showerror("AUVIZ", str(error))
 					else:
 						completed(result)
+					finally:
+						if was_export:
+							self.export_active = False
 		except queue.Empty:
 			pass
 		if self.root.winfo_exists():
-			self.root.after(80, self._poll_events)
+			self.poll_after_id = self.root.after(80, self._poll_events)
 
 	def _set_actions_enabled(self, enabled: bool) -> None:
 		state = tk.NORMAL if enabled else tk.DISABLED
@@ -1458,9 +2297,18 @@ class AudioVisualizerApp:
 	def _cancel(self) -> None:
 		self.cancel_event.set()
 		self.status_var.set("Cancelling")
+		if self.export_active:
+			self.export_progress_var.set("Cancelling render...")
 
 	def _close(self) -> None:
 		self.cancel_event.set()
+		self._stop_sample_playback(reset=False)
+		if self.preview_after_id is not None:
+			self.root.after_cancel(self.preview_after_id)
+			self.preview_after_id = None
+		if self.poll_after_id is not None:
+			self.root.after_cancel(self.poll_after_id)
+			self.poll_after_id = None
 		self.executor.shutdown(wait=False, cancel_futures=True)
 		self.root.destroy()
 
