@@ -136,6 +136,51 @@ class ExportResult:
 	preview_fps: float = 0.0
 
 
+@dataclass(frozen=True)
+class PaletteDefinition:
+	colors: tuple[str, ...]
+	positions: tuple[float, ...]
+
+	@classmethod
+	def create(
+		cls,
+		colors: Sequence[str],
+		positions: Sequence[float] | None = None,
+	) -> PaletteDefinition:
+		color_values = tuple(str(color) for color in colors)
+		if len(color_values) < 2:
+			raise ValueError("A custom colormap needs at least two colors.")
+		if not all(matplotlib.colors.is_color_like(color) for color in color_values):
+			raise ValueError("The custom colormap contains an invalid color.")
+		if positions is None:
+			position_values = tuple(float(value) for value in np.linspace(0.0, 1.0, len(color_values)))
+		else:
+			position_values = tuple(float(value) for value in positions)
+		if len(position_values) != len(color_values):
+			raise ValueError("Each custom color must have one stop position.")
+		if not all(math.isfinite(value) for value in position_values):
+			raise ValueError("Custom color stop positions must be finite.")
+		if any(right <= left for left, right in zip(position_values, position_values[1:])):
+			raise ValueError("Custom color stop positions must be strictly increasing.")
+		if abs(position_values[0]) > 1e-9 or abs(position_values[-1] - 1.0) > 1e-9:
+			raise ValueError("Custom colormaps must start at 0 and end at 1.")
+		return cls(color_values, position_values)
+
+	@classmethod
+	def from_json(cls, value: object) -> PaletteDefinition:
+		if isinstance(value, list):
+			return cls.create(value)
+		if isinstance(value, dict):
+			colors = value.get("colors")
+			positions = value.get("positions")
+			if isinstance(colors, list) and isinstance(positions, list):
+				return cls.create(colors, positions)
+		raise ValueError("The saved custom palette is malformed.")
+
+	def to_json(self) -> dict[str, list[str] | list[float]]:
+		return {"colors": list(self.colors), "positions": list(self.positions)}
+
+
 def _report(progress: ProgressCallback | None, phase: str, current: int, total: int) -> None:
 	if progress is not None:
 		progress(phase, current, total)
@@ -435,11 +480,18 @@ class CartesianWaveRenderer:
 		return left_field
 
 
-def build_colormap(name: str, custom_colors: Sequence[str]) -> Colormap:
+def build_colormap(
+	name: str,
+	custom_colors: Sequence[str],
+	custom_positions: Sequence[float] | None = None,
+) -> Colormap:
 	if name == "Custom":
-		if len(custom_colors) < 2:
-			raise ValueError("A custom colormap needs at least two colors.")
-		return LinearSegmentedColormap.from_list("custom_visualizer", list(custom_colors), N=256)
+		palette = PaletteDefinition.create(custom_colors, custom_positions)
+		return LinearSegmentedColormap.from_list(
+			"custom_visualizer",
+			list(zip(palette.positions, palette.colors)),
+			N=256,
+		)
 	return matplotlib.colormaps[name]
 
 
@@ -758,6 +810,187 @@ class ColormapPicker(ttk.Frame):
 		self.search_var.set("")
 
 
+class PaletteStopEditor(ttk.Frame):
+	"""Edit custom colormap colors and their normalized stop positions."""
+
+	BAR_TOP = 8
+	BAR_BOTTOM = 30
+	HANDLE_TOP = 43
+	HANDLE_BOTTOM = 61
+	MARGIN = 10
+	MAX_STOPS = 10
+	MINIMUM_GAP = 0.015
+
+	def __init__(
+		self,
+		parent: tk.Misc,
+		colors: Sequence[str],
+		positions: Sequence[float],
+		on_change: Callable[[list[str], list[float]], None],
+	) -> None:
+		super().__init__(parent)
+		self.colors = list(colors)
+		self.positions = list(positions)
+		self.on_change = on_change
+		self.selected_index = 0
+		self.dragging = False
+		self.drag_moved = False
+
+		self.canvas = tk.Canvas(
+			self,
+			height=70,
+			background="#f5f7f6",
+			highlightthickness=1,
+			highlightbackground="#cdd8d5",
+		)
+		self.canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+		controls = ttk.Frame(self, padding=(6, 0, 0, 0))
+		controls.pack(side=tk.RIGHT, fill=tk.Y)
+		ttk.Button(controls, text="+", width=3, command=self.add_stop).pack(pady=(0, 3))
+		ttk.Button(controls, text="-", width=3, command=self.remove_selected).pack(pady=3)
+		ttk.Button(controls, text="Reset", width=7, command=self.reset_positions).pack(pady=(3, 0))
+
+		self.canvas.bind("<Configure>", lambda _event: self._draw())
+		self.canvas.bind("<ButtonPress-1>", self._on_press)
+		self.canvas.bind("<B1-Motion>", self._on_motion)
+		self.canvas.bind("<ButtonRelease-1>", self._on_release)
+		self._draw()
+
+	def set_stops(self, colors: Sequence[str], positions: Sequence[float]) -> None:
+		palette = PaletteDefinition.create(colors, positions)
+		self.colors = list(palette.colors)
+		self.positions = list(palette.positions)
+		self.selected_index = min(self.selected_index, len(self.colors) - 1)
+		self._draw()
+
+	def add_stop(self) -> None:
+		if len(self.colors) >= self.MAX_STOPS:
+			return
+		gaps = np.diff(self.positions)
+		left_index = int(np.argmax(gaps))
+		position = 0.5 * (self.positions[left_index] + self.positions[left_index + 1])
+		colormap = self._colormap()
+		color = matplotlib.colors.to_hex(colormap(position), keep_alpha=False)
+		insert_index = left_index + 1
+		self.positions.insert(insert_index, position)
+		self.colors.insert(insert_index, color)
+		self.selected_index = insert_index
+		self._changed()
+
+	def remove_selected(self) -> None:
+		if len(self.colors) <= 2:
+			return
+		self.colors.pop(self.selected_index)
+		self.positions.pop(self.selected_index)
+		self.positions[0] = 0.0
+		self.positions[-1] = 1.0
+		self.selected_index = min(self.selected_index, len(self.colors) - 1)
+		self._changed()
+
+	def reset_positions(self) -> None:
+		self.positions = [float(value) for value in np.linspace(0.0, 1.0, len(self.colors))]
+		self._changed()
+
+	def _colormap(self) -> Colormap:
+		return LinearSegmentedColormap.from_list(
+			"palette_editor",
+			list(zip(self.positions, self.colors)),
+			N=256,
+		)
+
+	def _x_for_position(self, position: float) -> float:
+		width = max(2 * self.MARGIN + 1, self.canvas.winfo_width())
+		return self.MARGIN + position * (width - 2 * self.MARGIN)
+
+	def _position_for_x(self, x_value: float) -> float:
+		width = max(2 * self.MARGIN + 1, self.canvas.winfo_width())
+		return float(np.clip((x_value - self.MARGIN) / (width - 2 * self.MARGIN), 0.0, 1.0))
+
+	def _draw(self) -> None:
+		if not self.canvas.winfo_exists():
+			return
+		self.canvas.delete("all")
+		colormap = self._colormap()
+		left = self._x_for_position(0.0)
+		right = self._x_for_position(1.0)
+		for index in range(128):
+			fraction = index / 127.0
+			next_fraction = (index + 1) / 128.0
+			color = matplotlib.colors.to_hex(colormap(fraction), keep_alpha=False)
+			x0 = left + fraction * (right - left)
+			x1 = left + next_fraction * (right - left) + 1.0
+			self.canvas.create_rectangle(x0, self.BAR_TOP, x1, self.BAR_BOTTOM, fill=color, outline="")
+		self.canvas.create_rectangle(left, self.BAR_TOP, right, self.BAR_BOTTOM, outline="#60727d")
+		for index, (position, color) in enumerate(zip(self.positions, self.colors)):
+			x_value = self._x_for_position(position)
+			outline = "#e45756" if index == self.selected_index else "#172a3a"
+			width = 3 if index == self.selected_index else 1
+			self.canvas.create_line(x_value, self.BAR_BOTTOM, x_value, self.HANDLE_TOP, fill="#172a3a", width=1)
+			self.canvas.create_polygon(
+				x_value - 4,
+				self.BAR_BOTTOM + 1,
+				x_value + 4,
+				self.BAR_BOTTOM + 1,
+				x_value,
+				self.BAR_BOTTOM + 7,
+				fill="#172a3a",
+				outline="",
+			)
+			self.canvas.create_oval(
+				x_value - 8,
+				self.HANDLE_TOP,
+				x_value + 8,
+				self.HANDLE_BOTTOM,
+				fill=color,
+				outline=outline,
+				width=width,
+			)
+
+	def _nearest_handle(self, x_value: float, y_value: float) -> int | None:
+		if y_value < self.BAR_BOTTOM or y_value > self.HANDLE_BOTTOM + 5:
+			return None
+		distances = [abs(x_value - self._x_for_position(position)) for position in self.positions]
+		index = int(np.argmin(distances))
+		return index if distances[index] <= 11 else None
+
+	def _on_press(self, event: object) -> None:
+		index = self._nearest_handle(float(getattr(event, "x", -100)), float(getattr(event, "y", -100)))
+		if index is None:
+			return
+		self.selected_index = index
+		self.dragging = True
+		self.drag_moved = False
+		self._draw()
+
+	def _on_motion(self, event: object) -> None:
+		if not self.dragging or self.selected_index in (0, len(self.positions) - 1):
+			return
+		position = self._position_for_x(float(getattr(event, "x", 0.0)))
+		minimum = self.positions[self.selected_index - 1] + self.MINIMUM_GAP
+		maximum = self.positions[self.selected_index + 1] - self.MINIMUM_GAP
+		position = float(np.clip(position, minimum, maximum))
+		if abs(position - self.positions[self.selected_index]) < 1e-6:
+			return
+		self.positions[self.selected_index] = position
+		self.drag_moved = True
+		self._changed()
+
+	def _on_release(self, _event: object) -> None:
+		if not self.dragging:
+			return
+		should_choose_color = not self.drag_moved
+		self.dragging = False
+		if should_choose_color:
+			selected = colorchooser.askcolor(self.colors[self.selected_index], parent=self.winfo_toplevel())[1]
+			if selected:
+				self.colors[self.selected_index] = selected
+				self._changed()
+
+	def _changed(self) -> None:
+		self._draw()
+		self.on_change(list(self.colors), list(self.positions))
+
+
 class EQCurveEditor(ttk.Frame):
 	"""A compact draggable low-shelf, bell, and high-shelf editor."""
 
@@ -907,7 +1140,7 @@ class EQCurveEditor(ttk.Frame):
 
 class AudioVisualizerApp:
 	PROJECT_FORMAT = "auviz-project"
-	PROJECT_VERSION = 1
+	PROJECT_VERSION = 2
 	PREVIEW_WIDTH = 720
 	PREVIEW_HEIGHT = 405
 	DEFAULT_SAMPLE_DURATION = 3.0
@@ -948,6 +1181,7 @@ class AudioVisualizerApp:
 		self.action_widgets: list[ttk.Button] = []
 
 		self.custom_colors = ["#081c2c", "#087f8c", "#f2a541", "#e45756", "#f7f3e8"]
+		self.custom_positions = [float(value) for value in np.linspace(0.0, 1.0, len(self.custom_colors))]
 		self.builtin_colormap_names = list(
 			dict.fromkeys(["turbo", "viridis", "inferno", "magma", "cividis", "RdBu_r", *sorted(matplotlib.colormaps)])
 		)
@@ -956,7 +1190,7 @@ class AudioVisualizerApp:
 		self._configure_style()
 		self._create_layout()
 		self._redraw_colormap_swatch()
-		self._redraw_palette_buttons()
+		self._sync_palette_editor()
 		self.poll_after_id = self.root.after(80, self._poll_events)
 
 	def _create_variables(self) -> None:
@@ -1126,12 +1360,13 @@ class AudioVisualizerApp:
 		self.colormap_swatch.pack(fill=tk.X, pady=(0, 14))
 
 		ttk.Label(tab, text="Custom palette", style="Section.TLabel").pack(anchor="w")
-		self.palette_frame = ttk.Frame(tab)
-		self.palette_frame.pack(fill=tk.X, pady=(7, 5))
-		palette_actions = ttk.Frame(tab)
-		palette_actions.pack(anchor="e")
-		ttk.Button(palette_actions, text="+", width=3, command=self._add_color).pack(side=tk.LEFT, padx=2)
-		ttk.Button(palette_actions, text="-", width=3, command=self._remove_color).pack(side=tk.LEFT, padx=2)
+		self.palette_editor = PaletteStopEditor(
+			tab,
+			self.custom_colors,
+			self.custom_positions,
+			self._custom_palette_changed,
+		)
+		self.palette_editor.pack(fill=tk.X, pady=(7, 5))
 
 		name_row = ttk.Frame(tab)
 		name_row.pack(fill=tk.X, pady=(12, 2))
@@ -1377,7 +1612,10 @@ class AudioVisualizerApp:
 				"colormap": self.colormap_var.get(),
 				"custom_name": self.custom_colormap_name_var.get(),
 				"custom_colors": list(self.custom_colors),
-				"saved_colormaps": self.saved_colormaps,
+				"custom_positions": list(self.custom_positions),
+				"saved_colormaps": {
+					name: palette.to_json() for name, palette in self.saved_colormaps.items()
+				},
 				"upper_bound": float(self.colormap_upper_var.get()),
 			},
 			"export": {"resolution": self.resolution_var.get()},
@@ -1490,24 +1728,24 @@ class AudioVisualizerApp:
 		self.smoothing_var.set(float(processing.get("smoothing", 0.3)))
 
 		custom_colors = color.get("custom_colors", self.custom_colors)
-		if not (
-			isinstance(custom_colors, list)
-			and len(custom_colors) >= 2
-			and all(isinstance(item, str) and matplotlib.colors.is_color_like(item) for item in custom_colors)
-		):
+		custom_positions = color.get("custom_positions")
+		if not isinstance(custom_colors, list):
 			raise ValueError("The project custom palette is malformed.")
+		if custom_positions is not None and not isinstance(custom_positions, list):
+			raise ValueError("The project custom palette positions are malformed.")
+		custom_palette = PaletteDefinition.create(custom_colors, custom_positions)
 		project_colormaps = color.get("saved_colormaps", {})
 		if not isinstance(project_colormaps, dict):
 			raise ValueError("The project saved palettes are malformed.")
-		for name, colors in project_colormaps.items():
-			if (
-				isinstance(name, str)
-				and isinstance(colors, list)
-				and len(colors) >= 2
-				and all(isinstance(item, str) and matplotlib.colors.is_color_like(item) for item in colors)
-			):
-				self.saved_colormaps[name] = list(colors)
-		self.custom_colors = list(custom_colors)
+		for name, palette_value in project_colormaps.items():
+			if not isinstance(name, str):
+				continue
+			try:
+				self.saved_colormaps[name] = PaletteDefinition.from_json(palette_value)
+			except ValueError:
+				continue
+		self.custom_colors = list(custom_palette.colors)
+		self.custom_positions = list(custom_palette.positions)
 		colormap_name = str(color.get("colormap", "turbo"))
 		if colormap_name not in self._colormap_names():
 			colormap_name = "Custom"
@@ -1515,7 +1753,7 @@ class AudioVisualizerApp:
 		self.custom_colormap_name_var.set(str(color.get("custom_name", "")))
 		self.colormap_upper_var.set(float(color.get("upper_bound", 0.3)))
 		self.colormap_picker.set_choices(self._colormap_names())
-		self._redraw_palette_buttons()
+		self._sync_palette_editor()
 		self._redraw_colormap_swatch()
 
 		self.resolution_var.set(str(export.get("resolution", "1280 x 720")))
@@ -1717,29 +1955,29 @@ class AudioVisualizerApp:
 			folder = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "auviz"
 		return folder / "colormaps.json"
 
-	def _load_saved_colormaps(self) -> dict[str, list[str]]:
+	def _load_saved_colormaps(self) -> dict[str, PaletteDefinition]:
 		try:
 			payload = json.loads(self._colormap_store_path().read_text(encoding="utf-8"))
 		except (OSError, json.JSONDecodeError):
 			return {}
 		if not isinstance(payload, dict):
 			return {}
-		palettes: dict[str, list[str]] = {}
-		for name, colors in payload.items():
-			if (
-				isinstance(name, str)
-				and isinstance(colors, list)
-				and len(colors) >= 2
-				and all(isinstance(color, str) and matplotlib.colors.is_color_like(color) for color in colors)
-			):
-				palettes[name] = list(colors)
+		palettes: dict[str, PaletteDefinition] = {}
+		for name, palette_value in payload.items():
+			if not isinstance(name, str):
+				continue
+			try:
+				palettes[name] = PaletteDefinition.from_json(palette_value)
+			except ValueError:
+				continue
 		return palettes
 
-	def _persist_saved_colormaps(self, palettes: dict[str, list[str]]) -> None:
+	def _persist_saved_colormaps(self, palettes: dict[str, PaletteDefinition]) -> None:
 		path = self._colormap_store_path()
 		path.parent.mkdir(parents=True, exist_ok=True)
 		temporary_path = path.with_suffix(".tmp")
-		temporary_path.write_text(json.dumps(palettes, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+		payload = {name: palette.to_json() for name, palette in palettes.items()}
+		temporary_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 		temporary_path.replace(path)
 
 	def _colormap_names(self) -> list[str]:
@@ -1750,15 +1988,18 @@ class AudioVisualizerApp:
 
 	def _colormap_for_name(self, name: str) -> Colormap:
 		if name in self.saved_colormaps:
-			return LinearSegmentedColormap.from_list(name, self.saved_colormaps[name], N=256)
-		return build_colormap(name, self.custom_colors)
+			palette = self.saved_colormaps[name]
+			return LinearSegmentedColormap.from_list(name, list(zip(palette.positions, palette.colors)), N=256)
+		return build_colormap(name, self.custom_colors, self.custom_positions)
 
 	def _colormap_changed(self, _event: object | None = None) -> None:
 		name = self.colormap_var.get()
 		if name in self.saved_colormaps:
-			self.custom_colors = list(self.saved_colormaps[name])
+			palette = self.saved_colormaps[name]
+			self.custom_colors = list(palette.colors)
+			self.custom_positions = list(palette.positions)
 			self.custom_colormap_name_var.set(name)
-			self._redraw_palette_buttons()
+			self._sync_palette_editor()
 		elif name != "Custom":
 			self.custom_colormap_name_var.set("")
 		self._redraw_colormap_swatch()
@@ -1777,7 +2018,7 @@ class AudioVisualizerApp:
 			messagebox.showerror("Palette name unavailable", "Choose a name that is not a built-in colormap.")
 			return
 		updated = dict(self.saved_colormaps)
-		updated[name] = list(self.custom_colors)
+		updated[name] = PaletteDefinition.create(self.custom_colors, self.custom_positions)
 		try:
 			self._persist_saved_colormaps(updated)
 		except OSError as error:
@@ -1824,45 +2065,15 @@ class AudioVisualizerApp:
 			hex_color = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
 			self.colormap_swatch.create_rectangle(x0, 0, x1, height, fill=hex_color, outline="")
 
-	def _redraw_palette_buttons(self) -> None:
-		for child in self.palette_frame.winfo_children():
-			child.destroy()
-		for index, color in enumerate(self.custom_colors):
-			button = tk.Button(
-				self.palette_frame,
-				background=color,
-				activebackground=color,
-				width=3,
-				height=1,
-				relief=tk.FLAT,
-				command=lambda color_index=index: self._choose_custom_color(color_index),
-			)
-			button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+	def _sync_palette_editor(self) -> None:
+		if hasattr(self, "palette_editor"):
+			self.palette_editor.set_stops(self.custom_colors, self.custom_positions)
 
-	def _choose_custom_color(self, index: int) -> None:
-		selected = colorchooser.askcolor(self.custom_colors[index], parent=self.root)[1]
-		if selected:
-			self.custom_colors[index] = selected
-			self._custom_palette_changed()
-
-	def _add_color(self) -> None:
-		if len(self.custom_colors) >= 10:
-			return
-		selected = colorchooser.askcolor("#ffffff", parent=self.root)[1]
-		if selected:
-			self.custom_colors.append(selected)
-			self._custom_palette_changed()
-
-	def _remove_color(self) -> None:
-		if len(self.custom_colors) <= 2:
-			return
-		self.custom_colors.pop()
-		self._custom_palette_changed()
-
-	def _custom_palette_changed(self) -> None:
+	def _custom_palette_changed(self, colors: list[str], positions: list[float]) -> None:
+		self.custom_colors = list(colors)
+		self.custom_positions = list(positions)
 		self.colormap_var.set("Custom")
 		self.colormap_picker.refresh_image("Custom")
-		self._redraw_palette_buttons()
 		self._redraw_colormap_swatch()
 		self._color_control_changed()
 
